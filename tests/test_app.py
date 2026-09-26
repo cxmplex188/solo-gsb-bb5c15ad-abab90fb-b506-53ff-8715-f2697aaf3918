@@ -74,6 +74,22 @@ def test_house_scoring():
     assert score_house("12", "99") == 0.0
 
 
+def test_compound_house_scoring():
+    # Identical range/slash compounds still score full marks.
+    assert score_house("12-14", "12-14") == 1.0
+    assert score_house("12/14", "12/14") == 1.0
+    # A differing trailing segment is a wrong house number: low, never the
+    # full score the old leading-number-only logic gave to 12-14 vs 12-16.
+    assert 0.0 < score_house("12-14", "12-16") <= 0.3
+    assert 0.0 < score_house("12/14", "12/16") <= 0.3
+    # Range vs slash structure, compound vs plain number and segment-count
+    # differences are all structural mismatches -> wrong house number.
+    assert score_house("12-14", "12/14") == 0.0
+    assert score_house("12-14", "12") == 0.0
+    assert score_house("12", "12-14") == 0.0
+    assert score_house("12-14-16", "12-14") == 0.0
+
+
 # ------------------------------------------------------------- end-to-end API
 
 
@@ -108,6 +124,39 @@ def test_match_house_conflict_needs_review(client):
     assert data["status"] == "needs_review"
     conflict_fields = {c["field"] for c in best["conflicts"]}
     assert "house_number" in conflict_fields
+
+
+def test_compound_house_range_mismatch_not_auto_matched(client):
+    # The only candidate on this street is a neighbouring range; the query
+    # range 12-14 differs from candidate 12-16 in its trailing segment and
+    # must not be auto-accepted despite perfect street tokens.
+    csv_bytes = b"external_id,address\nRNG-1,12-16 Main Street\n"
+    r = client.post("/api/addresses/upload",
+                    files={"file": ("rng.csv", csv_bytes, "text/csv")})
+    assert r.status_code == 200
+
+    r = client.post("/api/match", json={"query": "12-14 Main St"})
+    data = r.json()
+    assert data["normalized"]["house"] == "12-14"
+    best = data["candidates"][0]
+    assert best["address"]["house"] == "12-16"
+    assert best["token_f1"] >= 0.99
+    assert best["house_score"] <= 0.3
+    assert data["status"] == "needs_review"
+    conflict = next(c for c in best["conflicts"] if c["field"] == "house_number")
+    assert conflict["query"] == "12-14"
+    assert conflict["candidate"] == "12-16"
+
+    # Batch matching uses the same scorer and must give the same verdict.
+    r = client.post("/api/match/batch", json={"queries": ["12/14 Main St"]})
+    batch_best = r.json()["results"][0]["candidates"][0]
+    assert r.json()["results"][0]["status"] == "needs_review"
+    assert batch_best["house_score"] <= 0.3
+    assert any(c["field"] == "house_number" for c in batch_best["conflicts"])
+
+    # The exact same compound range still auto-matches.
+    r = client.post("/api/match", json={"query": "12-16 Main St"})
+    assert r.json()["status"] == "auto_matched"
 
 
 def test_match_with_unit_suffix(client):
