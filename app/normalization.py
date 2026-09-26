@@ -9,7 +9,8 @@ The normaliser turns messy real-world address text into a comparable form:
   (``street/st.`` -> ``st``) and Chinese (``北京東路`` -> ``北京东路``);
 * house numbers are extracted with their own normalisation rules
   (``#12-B`` / ``No. 12b`` / ``12号`` -> ``12b``) and handled separately
-  from the word tokens.
+  from the word tokens; ranges and slash numbers stay whole
+  (``12-14`` / ``12–14`` / ``12/14``);
 
 Tokens are additionally split into two components so scoring can treat them
 differently:
@@ -89,7 +90,9 @@ _BUILDING_WORDS = re.compile(
     re.IGNORECASE,
 )
 _TRAILING_CJK_NO = re.compile(r"([0-9]+[a-z]?)\s*(?:号|號)")
-_NUMBER = re.compile(r"\d+[a-z]?(?:[-/](?:\d+[a-z]?|[a-z]))*")
+# Compound numbers stay whole: ranges ``12-14`` / ``12–14`` and slash
+# numbers ``12/14`` are extracted as one house number.
+_NUMBER = re.compile(r"\d+[a-z]?(?:[-–/](?:\d+[a-z]?|[a-z]))*")
 _POSTCODE = re.compile(r"^\d{5,6}(?:-\d{4})?$")
 
 # ------------------------------------------------------------------ result --

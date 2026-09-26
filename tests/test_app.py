@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app  # noqa: E402
+from app.config import get_settings  # noqa: E402
 from app.matcher import (  # noqa: E402
     levenshtein_ratio,
     match_address,
@@ -49,6 +50,16 @@ def test_house_number_formats():
     assert normalize("99 SW 26th Ave Unit 7B, Portland").house == "99"
 
 
+def test_compound_house_number_formats():
+    # ranges and slash numbers stay whole (and the en dash canonicalises)
+    assert normalize("12-14 Main St").house == "12-14"
+    assert normalize("12/14 Main St").house == "12/14"
+    n = normalize("12–14 Main St")
+    assert n.house == "12-14"
+    # the second range segment must not leak into the street tokens
+    assert "14" not in n.street_tokens
+
+
 def test_cjk_traditional_to_simplified_and_fullwidth():
     n = normalize("北京東路８８號 3楼")
     assert n.house == "88"
@@ -72,6 +83,70 @@ def test_house_scoring():
     assert score_house("12", None) == 0.15
     assert score_house("100", "1000") < 0.5
     assert score_house("12", "99") == 0.0
+
+
+def test_compound_house_scoring():
+    # fully identical compound numbers still score full marks
+    assert score_house("12-14", "12-14") == 1.0
+    assert score_house("12/14", "12/14") == 1.0
+    # a different later segment is a wrong house number, not full marks
+    assert 0.0 < score_house("12-14", "12-16") <= 0.3
+    assert 0.0 < score_house("12/14", "12/16") <= 0.3
+    # a different separator structure is a wrong house number too
+    assert score_house("12-14", "12/14") == 0.0
+    assert score_house("12-14", "12") == 0.0
+    assert score_house("12", "12-14") == 0.0
+    # letter-suffix semantics are preserved inside compounds
+    assert score_house("12b-14", "12-14") == 0.7
+    # missing-side semantics are unchanged for compounds
+    assert score_house("12-14", None) == 0.15
+
+
+def _row_dict(addr_id: int, text: str) -> dict:
+    """Fabricate the row shape ``match_address`` consumes (no DB needed)."""
+    import json
+
+    n = normalize(text)
+    return {
+        "id": addr_id,
+        "full_text": text,
+        "house": n.house,
+        "line1": None,
+        "city": None,
+        "state": None,
+        "postal_code": None,
+        "country": None,
+        "external_id": None,
+        "raw_json": "{}",
+        "tokens_json": json.dumps(n.tokens),
+        "street_tokens_json": json.dumps(n.street_tokens),
+        "locality_tokens_json": json.dumps(n.locality_tokens),
+    }
+
+
+def test_compound_house_range_not_auto_matched():
+    # The unique candidate differs only in the second range segment: under
+    # the default thresholds this must go to review, not auto-hit.
+    rows = [_row_dict(1, "12-16 Main St")]
+    settings = get_settings()
+
+    result = match_address("12-14 Main St", rows, settings)
+    assert result.best is not None
+    assert result.best.house_score <= 0.3
+    assert result.best.score < settings.auto_threshold
+    assert result.status == "needs_review"
+    assert any(c["field"] == "house_number" for c in result.best.conflicts)
+
+    # the exact same compound number still auto-hits with full marks
+    exact = match_address("12-16 Main St", rows, settings)
+    assert exact.best.house_score == 1.0
+    assert exact.status == "auto_matched"
+
+    # a different separator structure (slash vs range) is a wrong number
+    slash = match_address("12/16 Main St", rows, settings)
+    assert slash.best.house_score == 0.0
+    assert slash.status == "needs_review"
+    assert any(c["field"] == "house_number" for c in slash.best.conflicts)
 
 
 # ------------------------------------------------------------- end-to-end API
@@ -137,6 +212,40 @@ def test_match_chinese(client):
 def test_match_no_match(client):
     r = client.post("/api/match", json={"query": "1 Milky Way, Mars Base"})
     assert r.json()["status"] == "no_match"
+
+
+def test_match_compound_house_range_api_and_batch(client):
+    # unique candidate differs only in the second segment of the range
+    r = client.post("/api/addresses", json={
+        "addresses": [{"address": "12-16 Zxrange Street, Rangesville"}],
+        "skip_duplicates": True,
+    })
+    assert r.status_code == 200
+
+    single = client.post(
+        "/api/match", json={"query": "12-14 Zxrange St, Rangesville"}
+    ).json()
+    assert single["status"] == "needs_review"
+    best = single["candidates"][0]
+    assert best["address"]["house"] == "12-16"
+    assert best["house_score"] <= 0.3
+    assert best["token_f1"] >= 0.99
+    conflict_fields = {c["field"] for c in best["conflicts"]}
+    assert "house_number" in conflict_fields
+
+    # batch matching goes through the same scorer and must agree
+    batch = client.post("/api/match/batch", json={
+        "queries": ["12-14 Zxrange St, Rangesville"],
+    }).json()
+    assert batch["results"][0]["status"] == single["status"]
+    assert batch["results"][0]["best_id"] == single["best_id"]
+
+    # the exact compound number still auto-hits through the same pipeline
+    exact = client.post(
+        "/api/match", json={"query": "12-16 Zxrange St, Rangesville"}
+    ).json()
+    assert exact["status"] == "auto_matched"
+    assert exact["candidates"][0]["house_score"] == 1.0
 
 
 def test_batch_and_review_flow(client):

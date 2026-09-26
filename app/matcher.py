@@ -7,6 +7,9 @@ The address is scored along two independent axes:
   fuzzily use a Levenshtein ratio above 0.72;
 * **house number** - scored separately so that ``100 Main St`` and
   ``1000 Main St`` are never confused despite near-identical street text.
+  Compound numbers (ranges ``12-14``, slash numbers ``12/14``) are compared
+  segment by segment including their separator structure, so ``12-14``
+  never scores full marks against ``12-16``.
 
 Final score = ``TOKEN_WEIGHT * token_f1 + (1-TOKEN_WEIGHT) * house_score``.
 """
@@ -297,6 +300,55 @@ def score_address_tokens(q_street: list[str], q_locality: list[str],
                              f1=round(total_f1, 3))
 
 
+# Canonical house numbers may be compound: ranges (``12-14``) or slash
+# numbers (``12/14``). They are split into numeric (or letter) segments
+# plus the separators between them, and both take part in scoring.
+_HOUSE_SEPARATORS = re.compile(r"([-/])")
+_HOUSE_NUMERIC_PART = re.compile(r"^(\d+)([a-z]?)$")
+_HOUSE_LETTER_PART = re.compile(r"^[a-z]+$")
+
+
+def _split_house(value: str) -> tuple[list[tuple[int | None, str]], list[str]]:
+    """Split a canonical house number into segments and separators.
+
+    ``12b``   -> ``([(12, "b")], [])``
+    ``12-14`` -> ``([(12, ""), (14, "")], ["-"])``
+    ``12/14`` -> ``([(12, ""), (14, "")], ["/"])``
+    """
+    segments: list[tuple[int | None, str]] = []
+    separators: list[str] = []
+    for part in _HOUSE_SEPARATORS.split(value):
+        if not part:
+            continue
+        if part in ("-", "/"):
+            separators.append(part)
+            continue
+        m = _HOUSE_NUMERIC_PART.match(part)
+        if m:
+            segments.append((int(m.group(1)), m.group(2)))
+        elif _HOUSE_LETTER_PART.match(part):
+            segments.append((None, part))
+        else:
+            segments.append((None, ""))
+    return segments, separators
+
+
+def _house_segment_score(q_num: int | None, q_letter: str,
+                         c_num: int | None, c_letter: str) -> float:
+    """Similarity of one pair of house-number segments (plain-number rules)."""
+    if q_num is None or c_num is None:
+        return 1.0 if (q_num, q_letter) == (c_num, c_letter) else 0.0
+    if q_num == c_num:
+        return 0.7 if q_letter != c_letter else 1.0
+    bigger = max(q_num, c_num)
+    closeness = 1 - abs(q_num - c_num) / bigger
+    # A wrong number usually means a different property, so non-exact values
+    # are capped low (~0.3) even when numerically adjacent; perfect street
+    # tokens plus a wrong house number therefore stay below the auto
+    # threshold and go to human review.
+    return min(0.3, closeness ** 4 * 0.3)
+
+
 def score_house(query: str | None, candidate: str | None) -> float:
     """House-number similarity with a harsh wrong-number penalty.
 
@@ -306,6 +358,12 @@ def score_house(query: str | None, candidate: str | None) -> float:
     * same digits with letter differences (``12b`` vs ``12``) -> 0.7;
     * numbers close in value get a small partial score;
     * completely different numbers -> 0.0.
+
+    Compound numbers (ranges ``12-14``, slash numbers ``12/14``) must agree
+    on **every** segment and on the separator structure: a different later
+    segment (``12-14`` vs ``12-16``) or a different structure (``12-14`` vs
+    ``12/14`` or vs ``12``) is a wrong house number and scores accordingly
+    low, so it cannot auto-match under the default thresholds.
     """
     if not query and not candidate:
         return 0.5
@@ -314,24 +372,29 @@ def score_house(query: str | None, candidate: str | None) -> float:
     if query == candidate:
         return 1.0
 
-    def split(value: str) -> tuple[int | None, str]:
-        m = re.match(r"^(\d+)([a-z]?)(?:[-/].*)?$", value)
-        return (int(m.group(1)), m.group(2)) if m else (None, "")
+    q_segments, q_separators = _split_house(query)
+    c_segments, c_separators = _split_house(candidate)
 
-    q_num, q_letter = split(query)
-    c_num, c_letter = split(candidate)
+    if q_separators or c_separators:
+        # At least one side is compound. A different separator structure
+        # (range vs slash vs plain number) is a different property.
+        if (q_separators != c_separators
+                or len(q_segments) != len(c_segments)):
+            return 0.0
+        # Same structure: every segment must agree and the worst segment
+        # decides, so ``12-14`` vs ``12-16`` scores like the wrong number
+        # ``14`` vs ``16`` instead of full marks on the shared ``12``.
+        return round(min(
+            _house_segment_score(q_num, q_letter, c_num, c_letter)
+            for (q_num, q_letter), (c_num, c_letter)
+            in zip(q_segments, c_segments)
+        ), 3)
+
+    q_num, q_letter = q_segments[0] if q_segments else (None, "")
+    c_num, c_letter = c_segments[0] if c_segments else (None, "")
     if q_num is None or c_num is None:
-        return 0.0 if query != candidate else 1.0
-    if q_num == c_num:
-        return 0.7 if q_letter != c_letter else 1.0
-
-    bigger, smaller = max(q_num, c_num), min(q_num, c_num)
-    closeness = 1 - abs(q_num - c_num) / bigger
-    # A wrong number usually means a different property, so non-exact values
-    # are capped low (~0.3) even when numerically adjacent; perfect street
-    # tokens plus a wrong house number therefore stay below the auto
-    # threshold and go to human review.
-    return round(min(0.3, closeness**4 * 0.3), 3)
+        return 0.0
+    return round(_house_segment_score(q_num, q_letter, c_num, c_letter), 3)
 
 
 # ----------------------------------------------------------------- matching
